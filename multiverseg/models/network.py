@@ -317,3 +317,197 @@ class MultiverSegNet(nn.Module):
 #         model.load_state_dict(state_dict)
 
 #     return model
+
+from transformers import AutoConfig, AutoModel, AutoProcessor
+from torchvision import transforms
+
+class IJEPAEncoder(nn.Module):
+    def __init__(self, model_id="jmtzt/ijepa_vith14_1k", out_dim=256, device="cuda"):
+        super().__init__()
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        config = AutoConfig.from_pretrained(model_id)
+        config.output_hidden_states = True
+        config.output_attentions = True
+        self.device = device
+
+        self.backbone = AutoModel.from_pretrained(model_id, config=config).to(self.device)
+        self.proj = nn.Conv2d(1280, out_dim, kernel_size=1)  # 1280 for ViT-H
+
+    def forward(self, x):
+        """
+        Accepts:
+        - x: Tensor of shape [B, C, H, W]  OR
+            Tensor of shape [B, S, C, H, W] (we'll squeeze S if S==1)
+
+        Returns:
+        - projected feature map [B, out_dim, H', W']
+        """
+        # Handle extra support dim: B x 1 x C x H x W -> B x C x H x W
+        if x.dim() == 5:
+            # Expecting support dim S==1 (B x 1 x C x H x W)
+            if x.shape[1] != 1:
+                raise ValueError(f"IJEPAEncoder expected S==1 support dim or a 4-D tensor, got S={x.shape[1]}")
+            x = x.squeeze(1)  # -> B x C x H x W
+        elif x.dim() != 4:
+            raise ValueError(f"IJEPAEncoder expected 4-D or 5-D tensor, got {x.dim()}-D tensor")
+
+        B, C, H, W = x.shape
+
+        # Make sure we have 3 channels for IJepa processor/backbone
+        if C >= 3:
+            images = x[:, :3, :, :]  # take first 3 channels
+        elif C == 1:
+            images = x.repeat(1, 3, 1, 1)  # grayscale -> RGB
+        else:
+            raise ValueError(f"IJEPAEncoder needs at least 1 channel, got {C}")
+
+        # Convert tensors to PIL-compatible format: HWC uint8 on CPU
+        pil_images = []
+        for i in range(B):
+            img = images[i].detach().cpu()
+            # If float tensor (0..1), convert to uint8
+            if torch.is_floating_point(img):
+                img = (img.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+            # img now is C x H x W, ToPILImage expects that layout
+            pil = transforms.ToPILImage()(img)
+            pil_images.append(pil)
+
+        # Use the processor (it will create pixel_values tensor)
+        inputs = self.processor(images=pil_images, return_tensors="pt")
+        # move pixel_values to device of backbone
+        pixel_values = inputs["pixel_values"].to(self.device)
+
+        outputs = self.backbone(pixel_values=pixel_values)
+        hidden = outputs.last_hidden_state  # [B, N, D]
+        B2, N, D = hidden.shape
+        H2 = W2 = int(N ** 0.5)
+        hidden = hidden.permute(0, 2, 1).reshape(B2, D, H2, W2)
+        return self.proj(hidden)
+import torch.nn.functional as F
+
+class MultiverSegNetIJepa(MultiverSegNet):
+    """
+    Variant of MultiverSegNet that replaces the original convolutional encoder
+    with a pretrained I-JEPA vision transformer backbone.
+
+    The IJepa feature map is projected and upsampled to create pseudo-skip
+    connections that match the expected decoder input structure.
+    The support branch still uses the original convolutional encoder path.
+    """
+
+    def __init__(self, *args, ijepa_out_dim=256, **kwargs):
+        super().__init__(*args, **kwargs)
+        print("[Override] Using I-JEPA backbone for target encoder")
+
+        # Initialize IJepa encoder
+        self.ijepa_encoder = IJEPAEncoder(out_dim=ijepa_out_dim).to(next(self.parameters()).device)
+
+        # Build adapters from IJepa channels -> encoder conv channels
+        encoder_blocks = list(map(as_2tuple, self.encoder_blocks))
+        conv_chs = [conv for (_, conv) in encoder_blocks]
+        self.ijepa_adapters = nn.ModuleList([
+            nn.Conv2d(ijepa_out_dim, conv_ch, kernel_size=1)
+            for conv_ch in conv_chs
+        ])
+
+        self.support_adapter = nn.Sequential(
+            nn.Conv2d(2, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+
+
+    def forward(self, target_image, support_images=None, support_labels=None):
+        """
+        Forward pass for MultiverSegNetIJepa.
+
+        Args:
+            target_image: [B, 5, H, W] or [B, 1, 5, H, W]
+            support_images: [B, S, 1, H, W]
+            support_labels: [B, S, 1, H, W]
+        Returns:
+            Segmentation logits [B, 1, H, W]
+        """
+        device = next(self.parameters()).device
+
+        # Ensure correct input shape
+        if target_image.dim() == 5:
+            target_image = target_image.squeeze(1)  # [B, 5, H, W]
+
+        # Encode target with IJEPA
+        ijepa_feats = self.ijepa_encoder(target_image)  # [B, C_ijepa, h', w']
+        B, Cij, Hij, Wij = ijepa_feats.shape
+
+        # Prepare or fill in missing support tensors
+        if support_images is None or support_labels is None:
+            _, _, H, W = target_image.shape
+            support_images = 0.5 * torch.ones((B, 1, 1, H, W), device=device)
+            support_labels = 0.5 * torch.ones((B, 1, 1, H, W), device=device)
+
+        support = torch.cat([support_images, support_labels], dim=2)  # [B, S, 2, H, W]
+        support = vmap(self.support_adapter, support)                 # [B, S, 256, H, W]
+
+        # Build support feature maps through the encoder support path
+        support_skips = []
+        support_curr = support
+
+        # compute input spatial size
+        if target_image.dim() == 4:
+            _, _, H_orig, W_orig = target_image.shape
+        else:
+            _, _, _, H_orig, W_orig = target_image.shape
+
+        curH, curW = H_orig, W_orig
+        spatial_sizes = []
+        for _ in self.enc_blocks:
+            spatial_sizes.append((curH, curW))
+            curH //= 2
+            curW //= 2
+
+        for i, enc_block in enumerate(self.enc_blocks):
+            support_curr = enc_block.support(support_curr)
+            support_skips.append(support_curr)
+            if i != len(self.enc_blocks) - 1:
+                support_curr = vmap(self.downsample, support_curr)
+
+        # Build pseudo target skip connections using IJepa features + adapters
+        target_skips = []
+        for i, adapter in enumerate(self.ijepa_adapters):
+            skip = adapter(ijepa_feats)  # [B, conv_ch, h', w']
+            size_h, size_w = spatial_sizes[i]
+            if (Hij, Wij) != (size_h, size_w):
+                skip = F.interpolate(skip, size=(size_h, size_w),
+                                     mode="bilinear", align_corners=False)
+            skip = E.rearrange(skip, "B C H W -> B 1 C H W")
+            target_skips.append(skip)
+
+        # Combine into pass-through tuples (target_skip, support_skip)
+        pass_through = [
+            (target_skips[i], support_skips[i])
+            for i in range(len(self.enc_blocks) - 1)
+        ]
+
+        # Deepest feature = last adapter output
+        deepest_idx = len(self.ijepa_adapters) - 1
+        deepest_target = self.ijepa_adapters[deepest_idx](ijepa_feats)
+        target_h, target_w = spatial_sizes[deepest_idx]
+        if (Hij, Wij) != (target_h, target_w):
+            deepest_target = F.interpolate(deepest_target,
+                                           size=(target_h, target_w),
+                                           mode="bilinear", align_corners=False)
+        target = E.rearrange(deepest_target, "B C H W -> B 1 C H W")
+        support_deep = support_skips[deepest_idx]
+
+        # Decode with existing decoder
+        for decoder_block in self.dec_blocks:
+            target_skip, support_skip = pass_through.pop()
+            target = torch.cat([vmap(self.upsample, target), target_skip], dim=2)
+            support = torch.cat([vmap(self.upsample, support_deep), support_skip], dim=2)
+            target, support = decoder_block(target, support)
+            support_deep = support  # update for next level
+
+        target = E.rearrange(target, "B 1 C H W -> B C H W")
+        return self.out_conv(target)

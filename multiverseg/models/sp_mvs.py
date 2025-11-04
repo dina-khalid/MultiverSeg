@@ -10,7 +10,7 @@ from typing import Optional
 
 from scribbleprompt.models.unet import ScribblePromptUNet, prepare_inputs
 
-from multiverseg.models.network import MultiverSegNet
+from multiverseg.models.network import MultiverSegNet,MultiverSegNetIJepa
 from multiverseg.util.shapecheck import ShapeChecker
 
 checkpoint_dir = pathlib.Path(os.path.realpath(__file__)).parent.parent.parent / "checkpoints"
@@ -22,7 +22,7 @@ class MultiverSeg(nn.Module):
         "v1": checkpoint_dir / "MultiverSeg_v1_nf256_res128.pt" # ICCV 2025 checkpoint
     }
 
-    def __init__(self, version: str = "v1", min_context: int = 1, device = None):
+    def __init__(self, version: str = "v1", min_context: int = 1, device = None, use_ijepa: bool = False):
         super().__init__()
 
         if device is None:
@@ -47,6 +47,15 @@ class MultiverSeg(nn.Module):
         self.multiverseg.load_state_dict(
             torch.load(self.weights, map_location=self.device)["model"]
         )
+
+        if use_ijepa:
+            print("[INFO] Using IJepa backbone for MultiverSegNet")
+            self.multiverseg = MultiverSegNetIJepa(
+                in_channels=[5, 2],
+                encoder_blocks=[256, 256, 256, 256],
+                block_kws=dict(conv_kws=dict(norm="layer")),
+                cross_relu=True
+            ).to(self.device)
 
         self.scribbleprompt = ScribblePromptUNet(version='v1', device=self.device)
 
@@ -116,4 +125,23 @@ class MultiverSeg(nn.Module):
             return yhat
         else:
             return torch.sigmoid(yhat)
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
